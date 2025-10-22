@@ -10,7 +10,7 @@ permissions:
   projects: write
 
 env:
-  PROJECT_OWNER: LabKey            # org or user login (e.g., LabKey or rmorphew)
+  PROJECT_OWNER: rmorphew            # org or user login (e.g., LabKey or rmorphew)
   PROJECT_TITLE: Issue Tracker     # exact Project (v2) title
   FIELD_CREATED_BY: Created By     # Project TEXT field
   FIELD_CREATED_AT: Created At     # Project DATE field
