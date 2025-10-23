@@ -146,9 +146,23 @@ jobs:
                     fieldValues(first:20){
                       nodes{
                         __typename
-                        field { ... on ProjectV2FieldCommon { name } }
-                        ... on ProjectV2ItemFieldTextValue { text }
-                        ... on ProjectV2ItemFieldDateValue { date }
+                        ... on ProjectV2ItemFieldTextValue {
+                          text
+                          field { ... on ProjectV2FieldCommon { name } }
+                        }
+                        ... on ProjectV2ItemFieldDateValue {
+                          date
+                          field { ... on ProjectV2FieldCommon { name } }
+                        }
+                        # (optional – not needed for Created By/At but harmless)
+                        ... on ProjectV2ItemFieldSingleSelectValue {
+                          name
+                          field { ... on ProjectV2FieldCommon { name } }
+                        }
+                        ... on ProjectV2ItemFieldNumberValue {
+                          number
+                          field { ... on ProjectV2FieldCommon { name } }
+                        }
                       }
                     }
                   }
@@ -159,7 +173,7 @@ jobs:
           }
           EOF
           )
-
+          
           UPDATE_MUT='mutation($input:UpdateProjectV2ItemFieldValueInput!){
             updateProjectV2ItemFieldValue(input:$input){ projectV2Item { id } }
           }'
