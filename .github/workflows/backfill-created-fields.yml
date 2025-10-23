@@ -19,14 +19,14 @@ jobs:
   backfill:
     runs-on: ubuntu-latest
     steps:
-      - name: Resolve Project + Field IDs
+      - name: Resolve Project + Field IDs (paginated)
         id: meta
         env:
-          GH_TOKEN: ${{ secrets.PROJECTS_PAT }}   # classic PAT with scopes: repo, workflow, project
+          GH_TOKEN: ${{ secrets.PROJECTS_PAT }}   # classic PAT: repo, workflow, project
         run: |
           set -euo pipefail
 
-          # 1) Project id (prefer env.PROJECT_ID; else lookup by user+title)
+          # 1) Project id (prefer env.PROJECT_ID; else lookup)
           if [ -n "${PROJECT_ID:-}" ]; then
             pid="$PROJECT_ID"
             echo "Using PROJECT_ID from env: $pid"
@@ -38,9 +38,7 @@ jobs:
             body=$(jq -n --arg q "$q1" --arg login "$PROJECT_OWNER" '{query:$q,variables:{login:$login}}')
             resp=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -d "$body" https://api.github.com/graphql)
             if jq -e 'has("errors")' >/dev/null <<<"$resp"; then
-              echo "::error::GraphQL errors during project lookup:"
-              jq -C '.errors' <<<"$resp"
-              exit 1
+              echo "::error::GraphQL errors during project lookup:"; jq -C '.errors' <<<"$resp"; exit 1
             fi
             pid=$(jq -r --arg t "$PROJECT_TITLE" '.data.user.projectsV2.nodes[]? | select(.title==$t) | .id' <<<"$resp")
             [ -n "$pid" ] || { echo "::error::Project '$PROJECT_TITLE' not found for $PROJECT_OWNER"; exit 1; }
@@ -48,48 +46,75 @@ jobs:
           echo "project_id=$pid" >> "$GITHUB_OUTPUT"
           echo "Resolved project id: $pid"
 
-          # 2) Fetch fields, capture ids
-          q2='query($id:ID!){
+          # 2) Paginate fields(first:100)
+          read -r -d '' Q_FIELDS <<'EOF'
+          query($id:ID!, $after:String){
             node(id:$id){
               ... on ProjectV2{
-                fields(first:200){
+                fields(first:100, after:$after){
                   nodes{
                     __typename
                     ... on ProjectV2FieldCommon { id name dataType }
                   }
+                  pageInfo{ hasNextPage endCursor }
                 }
               }
             }
-          }'
-          body=$(jq -n --arg q "$q2" --arg id "$pid" '{query:$q,variables:{id:$id}}')
-          resp=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -d "$body" https://api.github.com/graphql)
-          if jq -e 'has("errors")' >/dev/null <<<"$resp"; then
-            echo "::error::GraphQL errors during field fetch:"
-            jq -C '.errors' <<<"$resp"
-            exit 1
+          }
+          EOF
+
+          want_by="${FIELD_CREATED_BY:-Created By}"
+          want_at="${FIELD_CREATED_AT:-Created At}"
+          by_id=""; at_id=""; at_dtype=""; after=""
+
+          echo "Scanning fields (paginated) looking for: '$want_by' (TEXT), '$want_at' (DATE/TEXT)"
+
+          while : ; do
+            # build variables with optional cursor
+            if [ -n "$after" ]; then
+              vars=$(jq -n --arg id "$pid" --arg after "$after" '{id:$id, after:$after}')
+            else
+              vars=$(jq -n --arg id "$pid" '{id:$id}')
+            fi
+            body=$(jq -n --arg q "$Q_FIELDS" --argjson v "$vars" '{query:$q,variables:$v}')
+            resp=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -d "$body" https://api.github.com/graphql)
+
+            if jq -e 'has("errors")' >/dev/null <<<"$resp"; then
+              echo "::error::GraphQL errors during field fetch:"; jq -C '.errors' <<<"$resp"; exit 1
+            fi
+
+            # print this page (for visibility)
+            jq -C '.data.node.fields.nodes[]? | {name,dataType,id}' <<<"$resp"
+
+            # try to capture IDs from this page
+            if [ -z "$by_id" ]; then
+              by_id=$(jq -r --arg n "$want_by" '.data.node.fields.nodes[]? | select(.name==$n and .dataType=="TEXT") | .id // empty' <<<"$resp")
+            fi
+            if [ -z "$at_id" ]; then
+              at_id=$(jq -r --arg n "$want_at" '.data.node.fields.nodes[]? | select(.name==$n and (.dataType=="DATE" or .dataType=="TEXT")) | .id // empty' <<<"$resp")
+              if [ -n "$at_id" ]; then
+                at_dtype=$(jq -r --arg n "$want_at" '.data.node.fields.nodes[]? | select(.name==$n and (.dataType=="DATE" or .dataType=="TEXT")) | .dataType' <<<"$resp")
+              fi
+            fi
+
+            hasNext=$(jq -r '.data.node.fields.pageInfo.hasNextPage' <<<"$resp")
+            after=$(jq -r '.data.node.fields.pageInfo.endCursor // ""' <<<"$resp")
+
+            # stop if both found or no more pages
+            if { [ -n "$by_id" ] && [ -n "$at_id" ]; } || [ "$hasNext" != "true" ]; then
+              break
+            fi
+          done
+
+          [ -n "$by_id" ] || echo "::warning::Field '$want_by' (TEXT) not found."
+          if [ -z "$at_id" ]; then
+            echo "::warning::Field '$want_at' (DATE/TEXT) not found."
           fi
 
-          echo "Fields (name, type, id):"
-          jq -C '.data.node.fields.nodes[]? | {name,dataType,id}' <<<"$resp"
-
-          by=$(jq -r --arg n "$FIELD_CREATED_BY" '.data.node.fields.nodes[]? | select(.name==$n and .dataType=="TEXT") | .id // empty' <<<"$resp")
-          at_date=$(jq -r --arg n "$FIELD_CREATED_AT" '.data.node.fields.nodes[]? | select(.name==$n and .dataType=="DATE") | .id // empty' <<<"$resp")
-          at_text=$(jq -r --arg n "$FIELD_CREATED_AT" '.data.node.fields.nodes[]? | select(.name==$n and .dataType=="TEXT") | .id // empty' <<<"$resp")
-
-          if [ -z "${by:-}" ]; then
-            echo "::warning::Field '$FIELD_CREATED_BY' (TEXT) not found."
-          fi
-          if [ -n "${at_date:-}" ]; then
-            at="$at_date"; at_type="DATE"
-          elif [ -n "${at_text:-}" ]; then
-            at="$at_text"; at_type="TEXT"
-          else
-            echo "::warning::Field '$FIELD_CREATED_AT' (DATE/TEXT) not found."
-          fi
-
-          echo "by_field=${by:-}"        >> "$GITHUB_OUTPUT"
-          echo "at_field=${at:-}"        >> "$GITHUB_OUTPUT"
-          echo "at_dtype=${at_type:-}"   >> "$GITHUB_OUTPUT"
+          echo "by_field=${by_id:-}"       >> "$GITHUB_OUTPUT"
+          echo "at_field=${at_id:-}"       >> "$GITHUB_OUTPUT"
+          echo "at_dtype=${at_dtype:-}"    >> "$GITHUB_OUTPUT"
+          echo "Resolved → Created By: ${by_id:-<missing>}, Created At: ${at_id:-<missing>} (type ${at_dtype:-n/a})"
 
       - name: Backfill missing values
         if: ${{ steps.meta.outputs.project_id != '' }}
