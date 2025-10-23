@@ -10,10 +10,10 @@ permissions:
   projects: write
 
 env:
-  PROJECT_OWNER: rmorphew          # user or org login
-  PROJECT_TITLE: Issue Tracker     # exact Project v2 title
-  FIELD_CREATED_BY: Created By     # TEXT field
-  FIELD_CREATED_AT: Created At     # DATE field
+  PROJECT_OWNER: rmorphew
+  PROJECT_TITLE: Issue Tracker
+  FIELD_CREATED_BY: Created By
+  FIELD_CREATED_AT: Created At
 
 jobs:
   set-fields:
@@ -23,121 +23,71 @@ jobs:
         id: vals
         run: |
           echo "issue_node_id=${{ github.event.projects_v2_item.content_node_id }}" >> "$GITHUB_OUTPUT"
-          echo "issue_api_url=${{ github.event.projects_v2_item.content_url }}"    >> "$GITHUB_OUTPUT"
-          echo "creator=${{ github.event.sender.login }}"                           >> "$GITHUB_OUTPUT"
+          echo "issue_api_url=${{ github.event.projects_v2_item.content_url }}" >> "$GITHUB_OUTPUT"
+          echo "creator=${{ github.event.sender.login }}" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve project id and field ids (org or user)
+      - name: Resolve project id and field ids
         id: meta
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          qOrg='query($login:String!){
-            organization(login:$login){
-              projectsV2(first:100){ nodes{ id title } }
-            }
-          }'
-          qUser='query($login:String!){
-            user(login:$login){
-              projectsV2(first:100){ nodes{ id title } }
-            }
-          }'
-
-          # try org
-          body=$(jq -n --arg q "$qOrg" --arg login "$PROJECT_OWNER" '{query:$q,variables:{login:$login}}')
+          qUser='query($login:String!){ user(login:$login){ projectsV2(first:100){ nodes{ id title } } } }'
+          body=$(jq -n --arg q "$qUser" --arg login "$PROJECT_OWNER" '{query:$q,variables:{login:$login}}')
           resp=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -d "$body" https://api.github.com/graphql)
-          pid=$(echo "$resp" | jq -r --arg t "$PROJECT_TITLE" '.data.organization.projectsV2.nodes[]? | select(.title==$t) | .id')
+          pid=$(echo "$resp" | jq -r --arg t "$PROJECT_TITLE" '.data.user.projectsV2.nodes[]? | select(.title==$t) | .id')
+          [ -n "$pid" ] || { echo "Project not found"; exit 0; }
 
-          # fall back to user
-          if [ -z "$pid" ] || [ "$pid" = "null" ]; then
-            body=$(jq -n --arg q "$qUser" --arg login "$PROJECT_OWNER" '{query:$q,variables:{login:$login}}')
-            resp=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -d "$body" https://api.github.com/graphql)
-            pid=$(echo "$resp" | jq -r --arg t "$PROJECT_TITLE" '.data.user.projectsV2.nodes[]? | select(.title==$t) | .id')
-          fi
-
-          [ -n "$pid" ] || { echo "Project not found; exiting."; exit 0; }
-
-          qFields='query($id:ID!){
-            node(id:$id){
-              ... on ProjectV2{
-                fields(first:100){
-                  nodes{ id name dataType }
-                }
-              }
-            }
-          }'
-
+          qFields='query($id:ID!){ node(id:$id){ ... on ProjectV2{ fields(first:100){ nodes{ id name dataType } } } } }'
           body=$(jq -n --arg q "$qFields" --arg id "$pid" '{query:$q,variables:{id:$id}}')
           resp=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -d "$body" https://api.github.com/graphql)
-
           by=$(echo "$resp" | jq -r --arg n "$FIELD_CREATED_BY" '.data.node.fields.nodes[] | select(.name==$n) | .id')
-          byT=$(echo "$resp" | jq -r --arg n "$FIELD_CREATED_BY" '.data.node.fields.nodes[] | select(.name==$n) | .dataType')
           at=$(echo "$resp" | jq -r --arg n "$FIELD_CREATED_AT" '.data.node.fields.nodes[] | select(.name==$n) | .id')
-          atT=$(echo "$resp" | jq -r --arg n "$FIELD_CREATED_AT" '.data.node.fields.nodes[] | select(.name==$n) | .dataType')
-
           echo "project_id=$pid" >> "$GITHUB_OUTPUT"
           echo "by_field_id=$by" >> "$GITHUB_OUTPUT"
-          echo "by_type=$byT"    >> "$GITHUB_OUTPUT"
           echo "at_field_id=$at" >> "$GITHUB_OUTPUT"
-          echo "at_type=$atT"    >> "$GITHUB_OUTPUT"
 
-      - name: Guard: fields must exist and be correct types
-        if: ${{ steps.meta.outputs.by_field_id == '' || steps.meta.outputs.at_field_id == '' || steps.meta.outputs.by_type != 'TEXT' || steps.meta.outputs.at_type != 'DATE' }}
-        run: echo "Skip: fields missing or wrong type."
-
-      - name: Find project item id for this issue
+      - name: Find project item id
         id: item
         env:
-          GH_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PROJECT_ID: ${{ steps.meta.outputs.project_id }}
           ISSUE_NODE: ${{ steps.vals.outputs.issue_node_id }}
         run: |
-          q='query($pid:ID!){
-            node(id:$pid){
-              ... on ProjectV2{
-                items(first:200){
-                  nodes{ id content{ __typename ... on Issue { id } } }
-                }
-              }
-            }
-          }'
+          q='query($pid:ID!){ node(id:$pid){ ... on ProjectV2{ items(first:200){ nodes{ id content{ ... on Issue { id } } } } } } }'
           body=$(jq -n --arg q "$q" --arg pid "$PROJECT_ID" '{query:$q,variables:{pid:$pid}}')
           resp=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -d "$body" https://api.github.com/graphql)
-          item_id=$(echo "$resp" | jq -r --arg iid "$ISSUE_NODE" '.data.node.items.nodes[] | select(.content.__typename=="Issue" and .content.id==$iid) | .id')
-          [ -n "$item_id" ] || { echo "No project item found; exiting."; exit 0; }
+          item_id=$(echo "$resp" | jq -r --arg iid "$ISSUE_NODE" '.data.node.items.nodes[] | select(.content.id==$iid) | .id')
+          [ -n "$item_id" ] || { echo "No project item found"; exit 0; }
           echo "item_id=$item_id" >> "$GITHUB_OUTPUT"
 
-      - name: Fetch Created At from the Issue API
+      - name: Fetch Created At
         id: created
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          resp=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "${{ steps.vals.outputs.issue_api_url }}")
+          resp=$(curl -s -H "Authorization: Bearer $GH_TOKEN" "${{ steps.vals.outputs.issue_api_url }}")
           date=$(echo "$resp" | jq -r '.created_at' | cut -c1-10)
           echo "created_date=$date" >> "$GITHUB_OUTPUT"
 
       - name: Update fields
-        if: ${{ steps.item.outputs.item_id != '' && steps.meta.outputs.by_type == 'TEXT' && steps.meta.outputs.at_type == 'DATE' }}
+        if: "${{ steps.item.outputs.item_id != '' }}"
         env:
-          GH_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PROJECT_ID: ${{ steps.meta.outputs.project_id }}
-          ITEM_ID:    ${{ steps.item.outputs.item_id }}
-          BY_FIELD:   ${{ steps.meta.outputs.by_field_id }}
-          AT_FIELD:   ${{ steps.meta.outputs.at_field_id }}
-          CREATOR:    ${{ steps.vals.outputs.creator }}
-          CREATED:    ${{ steps.created.outputs.created_date }}
+          ITEM_ID: ${{ steps.item.outputs.item_id }}
+          BY_FIELD: ${{ steps.meta.outputs.by_field_id }}
+          AT_FIELD: ${{ steps.meta.outputs.at_field_id }}
+          CREATOR: ${{ steps.vals.outputs.creator }}
+          CREATED: ${{ steps.created.outputs.created_date }}
         run: |
-          m='mutation($input:UpdateProjectV2ItemFieldValueInput!){
-               updateProjectV2ItemFieldValue(input:$input){ projectV2Item { id } }
-             }'
+          m='mutation($input:UpdateProjectV2ItemFieldValueInput!){ updateProjectV2ItemFieldValue(input:$input){ projectV2Item { id } } }'
 
-          # Created By (TEXT)
-          body=$(jq -n --arg m "$m" \
-                       --arg pid "$PROJECT_ID" --arg iid "$ITEM_ID" --arg fid "$BY_FIELD" --arg v "$CREATOR" \
-                       '{query:$m,variables:{input:{projectId:$pid,itemId:$iid,fieldId:$fid,value:{text:$v}}}}')
+          # Created By
+          body=$(jq -n --arg m "$m" --arg pid "$PROJECT_ID" --arg iid "$ITEM_ID" --arg fid "$BY_FIELD" --arg v "$CREATOR" \
+                 '{query:$m,variables:{input:{projectId:$pid,itemId:$iid,fieldId:$fid,value:{text:$v}}}}')
           curl -s -H "Authorization: Bearer $GH_TOKEN" -d "$body" https://api.github.com/graphql > /dev/null
 
-          # Created At (DATE: YYYY-MM-DD)
-          body=$(jq -n --arg m "$m" \
-                       --arg pid "$PROJECT_ID" --arg iid "$ITEM_ID" --arg fid "$AT_FIELD" --arg v "$CREATED" \
-                       '{query:$m,variables:{input:{projectId:$pid,itemId:$iid,fieldId:$fid,value:{date:$v}}}}')
+          # Created At
+          body=$(jq -n --arg m "$m" --arg pid "$PROJECT_ID" --arg iid "$ITEM_ID" --arg fid "$AT_FIELD" --arg v "$CREATED" \
+                 '{query:$m,variables:{input:{projectId:$pid,itemId:$iid,fieldId:$fid,value:{date:$v}}}}')
           curl -s -H "Authorization: Bearer $GH_TOKEN" -d "$body" https://api.github.com/graphql > /dev/null
