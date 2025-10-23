@@ -25,7 +25,7 @@ jobs:
           GH_TOKEN: ${{ secrets.PROJECTS_PAT }}   # classic PAT: repo, workflow, project
         run: |
           set -euo pipefail
-
+      
           # 1) Project id (prefer env.PROJECT_ID; else lookup)
           if [ -n "${PROJECT_ID:-}" ]; then
             pid="$PROJECT_ID"
@@ -45,9 +45,9 @@ jobs:
           fi
           echo "project_id=$pid" >> "$GITHUB_OUTPUT"
           echo "Resolved project id: $pid"
-
+      
           # 2) Paginate fields(first:100)
-          read -r -d '' Q_FIELDS <<'EOF'
+          Q_FIELDS=$(cat <<'EOF'
           query($id:ID!, $after:String){
             node(id:$id){
               ... on ProjectV2{
@@ -62,13 +62,14 @@ jobs:
             }
           }
           EOF
-
+          )
+      
           want_by="${FIELD_CREATED_BY:-Created By}"
           want_at="${FIELD_CREATED_AT:-Created At}"
           by_id=""; at_id=""; at_dtype=""; after=""
-
+      
           echo "Scanning fields (paginated) looking for: '$want_by' (TEXT), '$want_at' (DATE/TEXT)"
-
+      
           while : ; do
             # build variables with optional cursor
             if [ -n "$after" ]; then
@@ -78,14 +79,14 @@ jobs:
             fi
             body=$(jq -n --arg q "$Q_FIELDS" --argjson v "$vars" '{query:$q,variables:$v}')
             resp=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -d "$body" https://api.github.com/graphql)
-
+      
             if jq -e 'has("errors")' >/dev/null <<<"$resp"; then
               echo "::error::GraphQL errors during field fetch:"; jq -C '.errors' <<<"$resp"; exit 1
             fi
-
+      
             # print this page (for visibility)
             jq -C '.data.node.fields.nodes[]? | {name,dataType,id}' <<<"$resp"
-
+      
             # try to capture IDs from this page
             if [ -z "$by_id" ]; then
               by_id=$(jq -r --arg n "$want_by" '.data.node.fields.nodes[]? | select(.name==$n and .dataType=="TEXT") | .id // empty' <<<"$resp")
@@ -96,21 +97,21 @@ jobs:
                 at_dtype=$(jq -r --arg n "$want_at" '.data.node.fields.nodes[]? | select(.name==$n and (.dataType=="DATE" or .dataType=="TEXT")) | .dataType' <<<"$resp")
               fi
             fi
-
+      
             hasNext=$(jq -r '.data.node.fields.pageInfo.hasNextPage' <<<"$resp")
             after=$(jq -r '.data.node.fields.pageInfo.endCursor // ""' <<<"$resp")
-
+      
             # stop if both found or no more pages
             if { [ -n "$by_id" ] && [ -n "$at_id" ]; } || [ "$hasNext" != "true" ]; then
               break
             fi
           done
-
+      
           [ -n "$by_id" ] || echo "::warning::Field '$want_by' (TEXT) not found."
           if [ -z "$at_id" ]; then
             echo "::warning::Field '$want_at' (DATE/TEXT) not found."
           fi
-
+      
           echo "by_field=${by_id:-}"       >> "$GITHUB_OUTPUT"
           echo "at_field=${at_id:-}"       >> "$GITHUB_OUTPUT"
           echo "at_dtype=${at_dtype:-}"    >> "$GITHUB_OUTPUT"
