@@ -27,17 +27,11 @@ jobs:
           set -e
           echo "Looking up project '${PROJECT_TITLE}' for user '${PROJECT_OWNER}'"
 
-          # Get project ID
-          q1='query($login:String!){
-            user(login:$login){ projectsV2(first:100){ nodes{ id title } } }
-          }'
-          body=$(jq -n --arg q "$q1" --arg login "$PROJECT_OWNER" '{query:$q,variables:{login:$login}}')
-          resp=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -d "$body" https://api.github.com/graphql)
-          echo "$resp" | jq -C .
-          pid=$(echo "$resp" | jq -r --arg t "$PROJECT_TITLE" '.data.user.projectsV2.nodes[]? | select(.title==$t) | .id')
-          [ -n "$pid" ] || { echo "::error::Project not found."; exit 1; }
+          # Directly set your project ID (avoids visibility issues)
+          pid="PVT_kwHOAgVoGc4BC4my"
           echo "project_id=$pid" >> "$GITHUB_OUTPUT"
-          echo "Resolved project id: $pid"
+          echo "Using fixed project id: $pid"
+
 
           # Verify fields exist and capture their IDs
           q2='query($id:ID!){
