@@ -1,16 +1,109 @@
-      - name: Backfill missing values (items→Issues; read fieldValues)
+name: Backfill Project Created By/At
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: read
+
+env:
+  # (Recommended) put your ProjectV2 node id here to skip lookup by title:
+  # PROJECT_ID: PVT_kwHOAgVoGc4BC4my
+  PROJECT_OWNER: rmorphew
+  PROJECT_TITLE: Issue Tracker
+  FIELD_CREATED_BY: Created By
+  FIELD_CREATED_AT: Created At
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve Project + Field IDs
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.PROJECTS_PAT }}   # classic PAT with scopes: repo, workflow, project
+        run: |
+          set -euo pipefail
+
+          # 1) Project id (prefer env.PROJECT_ID; else lookup by user+title)
+          if [ -n "${PROJECT_ID:-}" ]; then
+            pid="$PROJECT_ID"
+            echo "Using PROJECT_ID from env: $pid"
+          else
+            echo "Looking up project '${PROJECT_TITLE}' for user '${PROJECT_OWNER}'"
+            q1='query($login:String!){
+              user(login:$login){ projectsV2(first:100){ nodes{ id title } } }
+            }'
+            body=$(jq -n --arg q "$q1" --arg login "$PROJECT_OWNER" '{query:$q,variables:{login:$login}}')
+            resp=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -d "$body" https://api.github.com/graphql)
+            if jq -e 'has("errors")' >/dev/null <<<"$resp"; then
+              echo "::error::GraphQL errors during project lookup:"
+              jq -C '.errors' <<<"$resp"
+              exit 1
+            fi
+            pid=$(jq -r --arg t "$PROJECT_TITLE" '.data.user.projectsV2.nodes[]? | select(.title==$t) | .id' <<<"$resp")
+            [ -n "$pid" ] || { echo "::error::Project '$PROJECT_TITLE' not found for $PROJECT_OWNER"; exit 1; }
+          fi
+          echo "project_id=$pid" >> "$GITHUB_OUTPUT"
+          echo "Resolved project id: $pid"
+
+          # 2) Fetch fields, capture ids
+          q2='query($id:ID!){
+            node(id:$id){
+              ... on ProjectV2{
+                fields(first:200){
+                  nodes{
+                    __typename
+                    ... on ProjectV2FieldCommon { id name dataType }
+                  }
+                }
+              }
+            }
+          }'
+          body=$(jq -n --arg q "$q2" --arg id "$pid" '{query:$q,variables:{id:$id}}')
+          resp=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -d "$body" https://api.github.com/graphql)
+          if jq -e 'has("errors")' >/dev/null <<<"$resp"; then
+            echo "::error::GraphQL errors during field fetch:"
+            jq -C '.errors' <<<"$resp"
+            exit 1
+          fi
+
+          echo "Fields (name, type, id):"
+          jq -C '.data.node.fields.nodes[]? | {name,dataType,id}' <<<"$resp"
+
+          by=$(jq -r --arg n "$FIELD_CREATED_BY" '.data.node.fields.nodes[]? | select(.name==$n and .dataType=="TEXT") | .id // empty' <<<"$resp")
+          at_date=$(jq -r --arg n "$FIELD_CREATED_AT" '.data.node.fields.nodes[]? | select(.name==$n and .dataType=="DATE") | .id // empty' <<<"$resp")
+          at_text=$(jq -r --arg n "$FIELD_CREATED_AT" '.data.node.fields.nodes[]? | select(.name==$n and .dataType=="TEXT") | .id // empty' <<<"$resp")
+
+          if [ -z "${by:-}" ]; then
+            echo "::warning::Field '$FIELD_CREATED_BY' (TEXT) not found."
+          fi
+          if [ -n "${at_date:-}" ]; then
+            at="$at_date"; at_type="DATE"
+          elif [ -n "${at_text:-}" ]; then
+            at="$at_text"; at_type="TEXT"
+          else
+            echo "::warning::Field '$FIELD_CREATED_AT' (DATE/TEXT) not found."
+          fi
+
+          echo "by_field=${by:-}"        >> "$GITHUB_OUTPUT"
+          echo "at_field=${at:-}"        >> "$GITHUB_OUTPUT"
+          echo "at_dtype=${at_type:-}"   >> "$GITHUB_OUTPUT"
+
+      - name: Backfill missing values
         if: ${{ steps.meta.outputs.project_id != '' }}
         env:
-          GH_TOKEN:  ${{ secrets.PROJECTS_PAT }}
+          GH_TOKEN:   ${{ secrets.PROJECTS_PAT }}
           PROJECT_ID: ${{ steps.meta.outputs.project_id }}
           BY_FIELD:   ${{ steps.meta.outputs.by_field }}
           AT_FIELD:   ${{ steps.meta.outputs.at_field }}
           AT_DTYPE:   ${{ steps.meta.outputs.at_dtype }}
         run: |
-          set -e
+          set -euo pipefail
           echo "Starting backfill for project $PROJECT_ID"
 
-          q_items=$(cat <<'EOF'
+          read -r -d '' Q_ITEMS <<'EOF'
           query($pid:ID!, $after:String){
             node(id:$pid){
               ... on ProjectV2{
@@ -36,9 +129,8 @@
             }
           }
           EOF
-          )
 
-          m_update='mutation($input:UpdateProjectV2ItemFieldValueInput!){
+          UPDATE_MUT='mutation($input:UpdateProjectV2ItemFieldValueInput!){
             updateProjectV2ItemFieldValue(input:$input){ projectV2Item { id } }
           }'
 
@@ -47,70 +139,65 @@
           updated=0
 
           while : ; do
-            # Build variables safely
             if [ -n "$after" ]; then
               vars=$(jq -n --arg pid "$PROJECT_ID" --arg after "$after" '{pid:$pid, after:$after}')
             else
               vars=$(jq -n --arg pid "$PROJECT_ID" '{pid:$pid}')
             fi
+            body=$(jq -n --arg q "$Q_ITEMS" --argjson v "$vars" '{query:$q,variables:$v}')
+            resp=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -d "$body" https://api.github.com/graphql)
 
-            body=$(jq -n --arg q "$q_items" --argjson v "$vars" '{query:$q,variables:$v}')
-            resp=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -d "$body" https://api.github.com/graphql)
-
-            # If GraphQL returned errors, show them and bail
-            if [ "$(echo "$resp" | jq 'has("errors")')" = "true" ]; then
-              echo "::error::GraphQL errors encountered when reading project items:"
-              echo "$resp" | jq -C '.errors'
-              echo "::group::Full response"; echo "$resp" | jq -C .; echo "::endgroup::"
+            if jq -e 'has("errors")' >/dev/null <<<"$resp"; then
+              echo "::error::GraphQL errors while listing items:"
+              jq -C '.errors' <<<"$resp"
+              echo "::group::Full response"; jq -C . <<<"$resp"; echo "::endgroup::"
               exit 1
             fi
 
-            # Defensive: if items is null, warn and stop (likely permissions/scope)
-            if [ "$(echo "$resp" | jq -r '.data.node.items | type')" != "object" ]; then
-              echo "::warning::Project items came back null. This usually means the token cannot read project items."
-              echo "Ensure your PAT is a CLASSIC token with scopes: repo, workflow, project."
-              echo "::group::Full response"; echo "$resp" | jq -C .; echo "::endgroup::"
+            if [ "$(jq -r '.data.node.items | type' <<<"$resp")" != "object" ]; then
+              echo "::warning::Project items were null (token likely lacks 'project' scope on classic PAT)."
+              echo "::group::Full response"; jq -C . <<<"$resp"; echo "::endgroup::"
               break
             fi
 
-            hasNext=$(echo "$resp" | jq -r '.data.node.items.pageInfo.hasNextPage')
-            after=$(echo "$resp" | jq -r '.data.node.items.pageInfo.endCursor // ""')
+            hasNext=$(jq -r '.data.node.items.pageInfo.hasNextPage' <<<"$resp")
+            after=$(jq -r '.data.node.items.pageInfo.endCursor // ""' <<<"$resp")
 
-            echo "$resp" | jq -c '.data.node.items.nodes[]' | while read -r node; do
+            jq -c '.data.node.items.nodes[]' <<<"$resp" | while read -r node; do
               scanned=$((scanned+1))
-              type=$(echo "$node" | jq -r '.content.__typename')
+              type=$(jq -r '.content.__typename' <<<"$node")
               [ "$type" = "Issue" ] || continue
 
-              itemId=$(echo "$node" | jq -r '.id')
-              author=$(echo "$node" | jq -r '.content.author.login // empty')
-              created=$(echo "$node" | jq -r '.content.createdAt[0:10] // empty')
+              itemId=$(jq -r '.id' <<<"$node")
+              author=$(jq -r '.content.author.login // empty' <<<"$node")
+              created=$(jq -r '.content.createdAt[0:10] // empty' <<<"$node")
 
-              haveBy=$(echo "$node" | jq -r --arg n "Created By" '.fieldValues.nodes[]? | select(.field.name==$n) | (.text // "")' | head -n1)
-              haveAtDate=$(echo "$node" | jq -r --arg n "Created At" '.fieldValues.nodes[]? | select(.field.name==$n and .__typename=="ProjectV2ItemFieldDateValue") | (.date // "")' | head -n1)
-              haveAtText=$(echo "$node" | jq -r --arg n "Created At" '.fieldValues.nodes[]? | select(.field.name==$n and .__typename=="ProjectV2ItemFieldTextValue") | (.text // "")' | head -n1)
+              haveBy=$(jq -r --arg n "Created By" '.fieldValues.nodes[]? | select(.field.name==$n) | (.text // "")' <<<"$node" | head -n1)
+              haveAtDate=$(jq -r --arg n "Created At" '.fieldValues.nodes[]? | select(.field.name==$n and .__typename=="ProjectV2ItemFieldDateValue") | (.date // "")' <<<"$node" | head -n1)
+              haveAtText=$(jq -r --arg n "Created At" '.fieldValues.nodes[]? | select(.field.name==$n and .__typename=="ProjectV2ItemFieldTextValue") | (.text // "")' <<<"$node" | head -n1)
 
               # Created By (TEXT)
-              if [ -n "$BY_FIELD" ] && [ -n "$author" ] && [ -z "$haveBy" ]; then
-                payload=$(jq -n --arg q "$m_update" \
+              if [ -n "${BY_FIELD:-}" ] && [ -n "$author" ] && [ -z "$haveBy" ]; then
+                payload=$(jq -n --arg q "$UPDATE_MUT" \
                              --arg pid "$PROJECT_ID" --arg iid "$itemId" --arg fid "$BY_FIELD" --arg v "$author" \
                              '{query:$q,variables:{input:{projectId:$pid,itemId:$iid,fieldId:$fid,value:{text:$v}}}}')
-                curl -s -H "Authorization: Bearer $GH_TOKEN" -d "$payload" https://api.github.com/graphql > /dev/null
+                curl -sS -H "Authorization: Bearer $GH_TOKEN" -d "$payload" https://api.github.com/graphql > /dev/null
                 updated=$((updated+1)); echo "Set Created By → $author"
               fi
 
               # Created At (DATE preferred; else TEXT)
-              if [ -n "$AT_FIELD" ] && [ -n "$created" ]; then
-                if [ "$AT_DTYPE" = "DATE" ] && [ -z "$haveAtDate" ]; then
-                  payload=$(jq -n --arg q "$m_update" \
+              if [ -n "${AT_FIELD:-}" ] && [ -n "$created" ]; then
+                if [ "${AT_DTYPE:-}" = "DATE" ] && [ -z "$haveAtDate" ]; then
+                  payload=$(jq -n --arg q "$UPDATE_MUT" \
                                --arg pid "$PROJECT_ID" --arg iid "$itemId" --arg fid "$AT_FIELD" --arg v "$created" \
                                '{query:$q,variables:{input:{projectId:$pid,itemId:$iid,fieldId:$fid,value:{date:$v}}}}')
-                  curl -s -H "Authorization: Bearer $GH_TOKEN" -d "$payload" https://api.github.com/graphql > /dev/null
+                  curl -sS -H "Authorization: Bearer $GH_TOKEN" -d "$payload" https://api.github.com/graphql > /dev/null
                   updated=$((updated+1)); echo "Set Created At (DATE) → $created"
-                elif [ "$AT_DTYPE" = "TEXT" ] && [ -z "$haveAtText" ]; then
-                  payload=$(jq -n --arg q "$m_update" \
+                elif [ "${AT_DTYPE:-}" = "TEXT" ] && [ -z "$haveAtText" ]; then
+                  payload=$(jq -n --arg q "$UPDATE_MUT" \
                                --arg pid "$PROJECT_ID" --arg iid "$itemId" --arg fid "$AT_FIELD" --arg v "$created" \
                                '{query:$q,variables:{input:{projectId:$pid,itemId:$iid,fieldId:$fid,value:{text:$v}}}}')
-                  curl -s -H "Authorization: Bearer $GH_TOKEN" -d "$payload" https://api.github.com/graphql > /dev/null
+                  curl -sS -H "Authorization: Bearer $GH_TOKEN" -d "$payload" https://api.github.com/graphql > /dev/null
                   updated=$((updated+1)); echo "Set Created At (TEXT) → $created"
                 fi
               fi
