@@ -1,0 +1,23 @@
+name: Test Project Access (read-only)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PAT can read your user project
+        env:
+          GH_TOKEN: ${{ secrets.PROJECTS_PAT }}   # classic PAT with repo, project, workflow
+          PROJECT_OWNER: rmorphew
+        run: |
+          # List your user Projects (v2)
+          q='query($login:String!){
+            user(login:$login){ projectsV2(first:50){ nodes{ id title } } }
+          }'
+          data=$(jq -n --arg q "$q" --arg login "$PROJECT_OWNER" '{query:$q,variables:{login:$login}}')
+          curl -sS -H "Authorization: Bearer $GH_TOKEN" -d "$data" https://api.github.com/graphql | jq -C .
+
+      - name: Done
+        run: echo "If you see your projects listed above, PAT access works."
