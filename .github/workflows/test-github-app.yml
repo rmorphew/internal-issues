@@ -1,0 +1,31 @@
+name: Test GitHub App Access
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create GitHub App token
+        id: app_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: rmorphew
+
+      - name: Check token and list your Projects (v2)
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          echo "Testing GitHub App token..."
+          echo "================================="
+          echo "Listing your Projects via GraphQL:"
+          echo "---------------------------------"
+          Q='query { viewer { projectsV2(first:10) { nodes { title id } } } }'
+          body=$(jq -n --arg q "$Q" '{query:$q}')
+          curl -sS -H "Authorization: Bearer $GH_TOKEN" -d "$body" https://api.github.com/graphql | jq -C .
