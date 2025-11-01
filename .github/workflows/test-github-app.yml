@@ -1,31 +1,38 @@
-name: Test GitHub App Access
+name: Test GitHub App
 
 on:
-  workflow_dispatch:
-
-permissions:
-  contents: read
+  workflow_dispatch: {}
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
     steps:
       - name: Create GitHub App token
-        id: app_token
+        id: app
         uses: actions/create-github-app-token@v1
         with:
           app-id: ${{ secrets.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
-          owner: rmorphew
+          owner: rmorphew  # your personal account
 
-      - name: Check token and list your Projects (v2)
+      - name: Check personal Projects (v2)
         env:
-          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
-          echo "Testing GitHub App token..."
-          echo "================================="
-          echo "Listing your Projects via GraphQL:"
-          echo "---------------------------------"
-          Q='query { viewer { projectsV2(first:10) { nodes { title id } } } }'
-          body=$(jq -n --arg q "$Q" '{query:$q}')
-          curl -sS -H "Authorization: Bearer $GH_TOKEN" -d "$body" https://api.github.com/graphql | jq -C .
+          set -euo pipefail
+          echo "🔍 Testing GitHub App token for rmorphew..."
+          echo "=========================================="
+          q='query($login:String!){
+            user(login:$login){
+              projectsV2(first:10){
+                nodes{ id title }
+              }
+            }
+          }'
+          vars=$(jq -n --arg login "rmorphew" '{login:$login}')
+          body=$(jq -n --arg q "$q" --argjson v "$vars" '{query:$q,variables:$v}')
+          curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+               -d "$body" https://api.github.com/graphql | jq -C .
